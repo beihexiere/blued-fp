@@ -6,15 +6,20 @@
 #import <mach-o/dyld.h>
 #import <dispatch/dispatch.h>
 #import <stdlib.h>
+#import <string.h>
 
-// 记录每个被替换的方法的原始实现（key 为所属 Class 指针）
-static NSMutableDictionary<NSValue *, NSValue *> *gOriginalIMPs = nil;
 static NSMutableSet<NSValue *> *gSwizzledClasses = nil;
+
+// 前置声明，供 bd_isOwnHookIMP 比对
+static void bd_didUpdateLocations(id self, SEL _cmd, CLLocationManager *manager, NSArray<CLLocation *> *locations);
+static void bd_didUpdateToLocation(id self, SEL _cmd, CLLocationManager *manager, CLLocation *newLocation, CLLocation *oldLocation);
+static CLLocation *bd_manager_location(id self, SEL _cmd);
+static BOOL bd_locationServicesEnabled(id self, SEL _cmd);
+static CLAuthorizationStatus bd_authorizationStatus(id self, SEL _cmd);
 
 static void bd_ensureGlobals(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        gOriginalIMPs = [NSMutableDictionary dictionary];
         gSwizzledClasses = [NSMutableSet set];
     });
 }
@@ -36,20 +41,30 @@ static BOOL bd_classDefinesMethod(Class cls, SEL sel) {
     return found;
 }
 
-/// 沿继承链找到 self 对应的原始实现
-static IMP bd_originalIMP(id self) {
+/// 是否是本插件装的 hook 实现
+static BOOL bd_isOwnHookIMP(IMP imp) {
+    return imp == (IMP)bd_didUpdateLocations || imp == (IMP)bd_didUpdateToLocation ||
+           imp == (IMP)bd_manager_location || imp == (IMP)bd_locationServicesEnabled ||
+           imp == (IMP)bd_authorizationStatus;
+}
+
+/// 沿继承链找"下一层真实实现"：跳过本插件自己的 hook，
+/// 这样父子类都实现同一方法时不会互相调用造成无限递归
+static IMP bd_nextImplementation(id self, SEL sel) {
     Class cls = object_getClass(self);
     while (cls) {
-        NSValue *value = gOriginalIMPs[[NSValue valueWithPointer:(__bridge const void *)cls]];
-        if (value) {
-            return (IMP)[value pointerValue];
+        if (bd_classDefinesMethod(cls, sel)) {
+            IMP imp = method_getImplementation(class_getInstanceMethod(cls, sel));
+            if (!bd_isOwnHookIMP(imp)) {
+                return imp;
+            }
         }
         cls = class_getSuperclass(cls);
     }
     return NULL;
 }
 
-/// 把一个实例方法替换成 newIMP，并记录原始实现
+/// 把一个实例方法替换成 newIMP
 static void bd_replaceInstanceMethod(Class cls, SEL sel, IMP newIMP) {
     if (!cls) {
         return;
@@ -59,7 +74,6 @@ static void bd_replaceInstanceMethod(Class cls, SEL sel, IMP newIMP) {
         return;
     }
     const char *types = method_getTypeEncoding(method);
-    IMP original = method_getImplementation(method);
 
     if (class_addMethod(cls, sel, newIMP, types)) {
         // 原本是继承来的，已在本类上新增了一份实现，父类不受影响
@@ -67,9 +81,7 @@ static void bd_replaceInstanceMethod(Class cls, SEL sel, IMP newIMP) {
         method_setImplementation(class_getInstanceMethod(cls, sel), newIMP);
     }
 
-    NSValue *key = [NSValue valueWithPointer:(__bridge const void *)cls];
-    gOriginalIMPs[key] = [NSValue valueWithPointer:(const void *)original];
-    [gSwizzledClasses addObject:key];
+    [gSwizzledClasses addObject:[NSValue valueWithPointer:(__bridge const void *)cls]];
 }
 
 static void bd_replaceClassMethod(Class cls, SEL sel, IMP newIMP) {
@@ -83,7 +95,7 @@ static void bd_didUpdateLocations(id self, SEL _cmd, CLLocationManager *manager,
     if (config.fakeLocationEnabled) {
         locations = @[ [config fakeLocation] ];
     }
-    IMP original = bd_originalIMP(self);
+    IMP original = bd_nextImplementation(self, _cmd);
     if (original) {
         ((void (*)(id, SEL, CLLocationManager *, NSArray *))original)(self, _cmd, manager, locations);
     }
@@ -94,7 +106,7 @@ static void bd_didUpdateToLocation(id self, SEL _cmd, CLLocationManager *manager
     if (config.fakeLocationEnabled) {
         newLocation = [config fakeLocation];
     }
-    IMP original = bd_originalIMP(self);
+    IMP original = bd_nextImplementation(self, _cmd);
     if (original) {
         ((void (*)(id, SEL, CLLocationManager *, CLLocation *, CLLocation *))original)(self, _cmd, manager, newLocation, oldLocation);
     }
@@ -105,18 +117,15 @@ static CLLocation *bd_manager_location(id self, SEL _cmd) {
     if (config.fakeLocationEnabled) {
         return [config fakeLocation];
     }
-    IMP original = bd_originalIMP(self);
-    if (!original) {
-        return nil;
-    }
-    return ((CLLocation * (*)(id, SEL))original)(self, _cmd);
+    IMP original = bd_nextImplementation(self, _cmd);
+    return original ? ((CLLocation * (*)(id, SEL))original)(self, _cmd) : nil;
 }
 
 static BOOL bd_locationServicesEnabled(id self, SEL _cmd) {
     if ([BDConfig shared].fakeLocationEnabled) {
         return YES;
     }
-    IMP original = bd_originalIMP(self);
+    IMP original = bd_nextImplementation(self, _cmd);
     return original ? ((BOOL(*)(id, SEL))original)(self, _cmd) : YES;
 }
 
@@ -124,8 +133,8 @@ static CLAuthorizationStatus bd_authorizationStatus(id self, SEL _cmd) {
     if ([BDConfig shared].fakeLocationEnabled) {
         return kCLAuthorizationStatusAuthorizedWhenInUse;
     }
-    IMP original = bd_originalIMP(self);
-    return original ? ((CLAuthorizationStatus(*)(id, SEL))original)(self, _cmd) : kCLAuthorizationStatusAuthorizedWhenInUse;
+    IMP original = bd_nextImplementation(self, _cmd);
+    return original ? ((CLAuthorizationStatus(*)(id, SEL))original)(self, _cmd) : kCLAuthorizationStatusNotDetermined;
 }
 
 #pragma mark - 扫描所有实现定位代理方法的类
@@ -149,6 +158,10 @@ static void bd_scanClasses(void) {
     for (int i = 0; i < count; i++) {
         Class cls = classes[i];
         if (!cls) {
+            continue;
+        }
+        const char *name = class_getName(cls);
+        if (!name || strncmp(name, "BD", 2) == 0) {
             continue;
         }
         NSValue *key = [NSValue valueWithPointer:(__bridge const void *)cls];
@@ -186,10 +199,10 @@ static void bd_image_added(const struct mach_header *header, intptr_t slide) {
     bd_replaceClassMethod(managerClass, @selector(locationServicesEnabled), (IMP)bd_locationServicesEnabled);
     bd_replaceClassMethod(managerClass, @selector(authorizationStatus), (IMP)bd_authorizationStatus);
 
-    // 后续动态加载的镜像（Flutter 插件、高德 SDK 等）加载时补扫一次
+    // 后续动态加载的镜像（Flutter 插件、地图 SDK 等）加载时补扫一次
     _dyld_register_func_for_add_image(bd_image_added);
 
-    NSLog(@"[BDHook] location hooks installed");
+    NSLog(@"[BDTweak] location hooks installed");
 }
 
 @end
