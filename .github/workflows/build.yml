@@ -1,0 +1,29 @@
+name: build-tweak
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 ldid
+        run: brew install ldid
+
+      - name: 编译 dylib
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: BDTweak
+          path: BDTweak.dylib
+          if-no-files-found: error
